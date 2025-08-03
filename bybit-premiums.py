@@ -25,102 +25,109 @@ API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 RECV_WINDOW = 5000
 
-# Simplified API client for cloud hosting compatibility
-class BybitAPIClient:
+# Multiple fallback methods for accessing Bybit API
+class BybitAPIWorkaround:
     def __init__(self):
-        # Primary endpoints to try
-        self.endpoints = [
+        # Known Bybit IP addresses (may change over time)
+        self.bybit_ips = [
+            "104.18.10.26",
+            "104.18.11.26", 
+            "172.67.74.226",
+            "104.18.8.26",
+            "104.18.9.26"
+        ]
+        
+        # Alternative API endpoints
+        self.alternative_endpoints = [
             "https://api.bybit.com",
-            "https://api.bytick.com",
-            "https://api-testnet.bybit.com"  # Fallback testnet
+            "https://api.bytick.com",  # Alternative domain
         ]
         
         self.working_endpoint = None
         self.session = None
         
-    def create_session(self):
-        """Create a robust session with retries"""
+    def create_dns_bypass_session(self, target_ip):
+        """Create a session that bypasses DNS by using direct IP"""
         session = requests.Session()
         
-        # Set up retry strategy
+        # Custom adapter for DNS bypass
+        class DNSBypassAdapter(HTTPAdapter):
+            def __init__(self, target_ip, target_host="api.bybit.com"):
+                self.target_ip = target_ip
+                self.target_host = target_host
+                super().__init__()
+            
+            def send(self, request, **kwargs):
+                # Replace hostname with IP in URL
+                if self.target_host in request.url:
+                    request.url = request.url.replace(self.target_host, self.target_ip)
+                    # Critical: Set Host header for proper routing
+                    request.headers['Host'] = self.target_host
+                
+                # Disable SSL verification for IP connections
+                kwargs['verify'] = False
+                
+                return super().send(request, **kwargs)
+        
+        # Mount the custom adapter
+        adapter = DNSBypassAdapter(target_ip)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        
+        # Set reasonable timeouts and retries
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        
-        # Set reasonable timeout
-        session.timeout = 30
+        session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
         
         return session
     
-    def test_endpoint(self, endpoint, debug=False):
+    def test_endpoint(self, endpoint_or_ip, is_ip=False):
         """Test if an endpoint is accessible"""
         try:
-            session = self.create_session()
-            test_url = f"{endpoint}/v5/market/time"
+            if is_ip:
+                session = self.create_dns_bypass_session(endpoint_or_ip)
+                test_url = f"https://{endpoint_or_ip}/v5/market/time"
+            else:
+                session = requests.Session()
+                test_url = f"{endpoint_or_ip}/v5/market/time"
             
-            if debug:
-                st.write(f"🔍 Testing: {test_url}")
-            
-            response = session.get(test_url, timeout=15)
-            
-            if debug:
-                st.write(f"Status Code: {response.status_code}")
-                st.write(f"Headers: {dict(response.headers)}")
-            
+            response = session.get(test_url, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                if debug:
-                    st.write(f"Response: {data}")
                 if data.get("retCode") == 0:
                     return True, session
-            else:
-                if debug:
-                    st.write(f"Response Text: {response.text[:200]}...")
-                    
-        except requests.exceptions.Timeout as e:
-            if debug:
-                st.write(f"⏰ Timeout error: {str(e)}")
-        except requests.exceptions.ConnectionError as e:
-            if debug:
-                st.write(f"🔌 Connection error: {str(e)}")
-        except requests.exceptions.SSLError as e:
-            if debug:
-                st.write(f"🔒 SSL error: {str(e)}")
         except Exception as e:
-            if debug:
-                st.write(f"❌ Other error: {str(e)}")
+            st.write(f"Failed to connect to {endpoint_or_ip}: {str(e)[:100]}...")
         
         return False, None
     
-    def find_working_connection(self, debug=False):
+    def find_working_connection(self):
         """Find a working connection method"""
-        if debug:
-            st.info("🔍 Testing Bybit API connection (Debug Mode)...")
-        else:
-            st.info("🔍 Testing Bybit API connection...")
+        st.info("🔍 Testing connection methods...")
         
-        for i, endpoint in enumerate(self.endpoints):
-            if debug:
-                st.write(f"**Attempt {i+1}/{len(self.endpoints)}: {endpoint}**")
-            
-            success, session = self.test_endpoint(endpoint, debug=debug)
+        # Method 1: Try standard endpoints first
+        for endpoint in self.alternative_endpoints:
+            st.write(f"Testing endpoint: {endpoint}")
+            success, session = self.test_endpoint(endpoint)
             if success:
-                st.success(f"✅ Connected to Bybit API")
+                st.success(f"✅ Connected via: {endpoint}")
                 self.working_endpoint = endpoint
                 self.session = session
                 return True
         
-        # If all fail, try once more with the primary endpoint and detailed debugging
-        if not debug:
-            st.warning("⚠️ Initial connection attempts failed. Trying with debug info...")
-            return self.find_working_connection(debug=True)
+        # Method 2: Try direct IP connections
+        st.write("Standard endpoints failed. Trying direct IP connections...")
+        for ip in self.bybit_ips:
+            st.write(f"Testing IP: {ip}")
+            success, session = self.test_endpoint(ip, is_ip=True)
+            if success:
+                st.success(f"✅ Connected via IP: {ip}")
+                self.working_endpoint = f"https://{ip}"
+                self.session = session
+                return True
         
         return False
     
@@ -128,124 +135,26 @@ class BybitAPIClient:
         """Make an API request using the working connection"""
         if not self.session or not self.working_endpoint:
             if not self.find_working_connection():
-                raise Exception("Unable to connect to Bybit API. Please check your internet connection.")
+                raise Exception("No working connection found")
         
         if headers is None:
             headers = {}
         
         # Construct full URL
-        url = f"{self.working_endpoint}{endpoint}"
+        if self.working_endpoint.startswith("https://"):
+            url = f"{self.working_endpoint}{endpoint}"
+        else:
+            url = f"https://{self.working_endpoint}{endpoint}"
         
-        # Make request with error handling
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = self.session.get(url, params=params, headers=headers, timeout=30)
-                response.raise_for_status()
-                return response.json()
-            except requests.exceptions.Timeout:
-                if attempt == max_retries - 1:
-                    raise Exception(f"Request timeout after {max_retries} attempts")
-                time.sleep(1)
-            except requests.exceptions.ConnectionError:
-                if attempt == max_retries - 1:
-                    raise Exception("Connection error. Please check your internet connection.")
-                time.sleep(1)
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise Exception(f"API request failed: {str(e)}")
-                time.sleep(1)
+        # Make request
+        response = self.session.get(url, params=params, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json()
 
 # Global API client
-api_client = BybitAPIClient()
-
-def test_basic_connectivity():
-    """Test basic internet connectivity"""
-    try:
-        # Test basic HTTP connectivity
-        response = requests.get("https://httpbin.org/get", timeout=10)
-        if response.status_code == 200:
-            st.success("✅ Basic internet connectivity works")
-            return True
-        else:
-            st.error(f"❌ Basic connectivity test failed: {response.status_code}")
-            return False
-    except Exception as e:
-        st.error(f"❌ No internet connectivity: {str(e)}")
-        return False
-
-def create_demo_data():
-    """Create demo data when API is not available"""
-    st.warning("📊 Using demo data since API is not accessible")
-    
-    # Create sample data that looks like real Bybit data
-    symbols = [
-        "BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
-        "LTCUSDT", "BCHUSDT", "XLMUSDT", "EOSUSDT", "TRXUSDT",
-        "XRPUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "MATICUSDT"
-    ]
-    
-    import random
-    random.seed(42)  # For consistent demo data
-    
-    demo_data = []
-    for symbol in symbols:
-        demo_data.append({
-            'symbol': symbol,
-            'price24hPcnt': random.uniform(-0.1, 0.1),
-            'fundingRate': random.uniform(-0.001, 0.001),
-            'volume24h': random.uniform(1e6, 1e9),
-            'openInterest': random.uniform(1e6, 1e8),
-            'lastPrice': random.uniform(0.1, 50000),
-            'markPrice': random.uniform(0.1, 50000),
-            'indexPrice': random.uniform(0.1, 50000),
-        })
-    
-    return pd.DataFrame(demo_data)
+api_client = BybitAPIWorkaround()
 
 def sign_request(endpoint: str, params: dict = None):
-    """Test basic internet connectivity"""
-    try:
-        # Test basic HTTP connectivity
-        response = requests.get("https://httpbin.org/get", timeout=10)
-        if response.status_code == 200:
-            st.success("✅ Basic internet connectivity works")
-            return True
-        else:
-            st.error(f"❌ Basic connectivity test failed: {response.status_code}")
-            return False
-    except Exception as e:
-        st.error(f"❌ No internet connectivity: {str(e)}")
-        return False
-
-def create_demo_data():
-    """Create demo data when API is not available"""
-    st.warning("📊 Using demo data since API is not accessible")
-    
-    # Create sample data that looks like real Bybit data
-    symbols = [
-        "BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
-        "LTCUSDT", "BCHUSDT", "XLMUSDT", "EOSUSDT", "TRXUSDT",
-        "XRPUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "MATICUSDT"
-    ]
-    
-    import random
-    random.seed(42)  # For consistent demo data
-    
-    demo_data = []
-    for symbol in symbols:
-        demo_data.append({
-            'symbol': symbol,
-            'price24hPcnt': random.uniform(-0.1, 0.1),
-            'fundingRate': random.uniform(-0.001, 0.001),
-            'volume24h': random.uniform(1e6, 1e9),
-            'openInterest': random.uniform(1e6, 1e8),
-            'lastPrice': random.uniform(0.1, 50000),
-            'markPrice': random.uniform(0.1, 50000),
-            'indexPrice': random.uniform(0.1, 50000),
-        })
-    
-    return pd.DataFrame(demo_data)
     """Sign and execute API request with DNS workaround"""
     if params is None:
         params = {}
@@ -500,36 +409,20 @@ def build_enhanced_dashboard():
     st.title("📊 Enhanced Bybit Dashboard")
     st.markdown("*Complete trading analysis with historical funding rates*")
     
-    # Add a prominent info box about Streamlit Cloud limitations
-    st.info("""
-    🌐 **Streamlit Cloud Notice:** Bybit's API blocks requests from Streamlit Cloud (HTTP 403). 
-    Enable **"Use Demo Data"** below to explore all dashboard features, or run this locally for live data.
-    """)
-    
     # Check credentials
     if not API_KEY or not API_SECRET:
-        st.warning("🔑 API credentials not configured - Demo mode available below")
-        st.info("To use live data locally, set BYBIT_API_KEY and BYBIT_API_SECRET environment variables")
+        st.error("🚫 Missing API credentials.")
+        st.stop()
     
     # Connection status
-    with st.expander("🔧 Connection Status", expanded=False):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("🔄 Test API Connection"):
-                if api_client.find_working_connection():
-                    st.success("✅ Successfully connected to Bybit API!")
-                    st.info(f"Using endpoint: {api_client.working_endpoint}")
-                else:
-                    st.error("❌ Could not establish connection to Bybit API")
-        
-        with col2:
-            if st.button("🌐 Test Basic Connectivity"):
-                test_basic_connectivity()
-        
-        # Option to use demo data
-        use_demo_data = st.checkbox("📊 Use Demo Data (if API fails)", value=False,
-                                  help="Use sample data for testing the dashboard when API is not available")
+    with st.expander("🔧 Connection Status", expanded=True):
+        if st.button("🔄 Test Connection"):
+            if api_client.find_working_connection():
+                st.success("✅ Successfully connected to Bybit API!")
+                st.info(f"Using endpoint: {api_client.working_endpoint}")
+            else:
+                st.error("❌ Could not establish connection")
+                st.stop()
     
     # Sidebar controls
     st.sidebar.header("🔎 Filters & Settings")
@@ -553,42 +446,19 @@ def build_enhanced_dashboard():
     # Main data fetching
     with st.spinner("Fetching comprehensive market data..."):
         try:
-            # Check if we should use demo data
-            if use_demo_data:
-                st.info("📊 Using demo data mode")
-                tickers = create_demo_data()
-                st.success(f"✅ Loaded {len(tickers)} demo symbols")
-            else:
-                # Ensure connection
-                if not api_client.working_endpoint:
-                    with st.spinner("Establishing connection to Bybit API..."):
-                        if not api_client.find_working_connection():
-                            st.error("❌ Cannot establish connection to Bybit API")
-                            st.error("**Root Cause:** Streamlit Cloud IPs are blocked by Bybit's CloudFront CDN (HTTP 403)")
-                            st.error("**Solutions:**")
-                            st.write("✅ **Enable 'Use Demo Data' above** - This will let you explore all dashboard features")
-                            st.write("🏠 **Run locally** - The API works fine from personal computers")
-                            st.write("☁️ **Use different hosting** - Try Heroku, Railway, or other platforms")
-                            st.write("🔑 **VPN/Proxy service** - Some cloud platforms support this")
-                            
-                            # Show basic connectivity test
-                            st.write("**Connectivity Diagnosis:**")
-                            if test_basic_connectivity():
-                                st.write("✅ Internet works - This confirms it's specifically Bybit blocking Streamlit Cloud")
-                                st.write("💡 **Recommended:** Use the demo data option to explore the dashboard!")
-                            else:
-                                st.write("❌ Basic connectivity also failed")
-                            
-                            st.stop()
-                
-                # Fetch tickers (includes current funding rates)
-                tickers = fetch_tickers()
-                if tickers.empty:
-                    st.error("🚫 No ticker data received")
-                    st.info("💡 Try enabling 'Use Demo Data' option to test the dashboard")
+            # Ensure connection
+            if not api_client.working_endpoint:
+                if not api_client.find_working_connection():
+                    st.error("❌ Cannot establish connection")
                     st.stop()
-                
-                st.success(f"✅ Loaded {len(tickers)} symbols")
+            
+            # Fetch tickers (includes current funding rates)
+            tickers = fetch_tickers()
+            if tickers.empty:
+                st.error("🚫 No ticker data received")
+                st.stop()
+            
+            st.success(f"✅ Loaded {len(tickers)} symbols")
             
             # Get symbols list
             symbols = tickers["symbol"].unique().tolist()
@@ -599,55 +469,40 @@ def build_enhanced_dashboard():
             # Filter tickers to match symbols
             tickers = tickers[tickers["symbol"].isin(symbols)]
             
-            # Fetch instruments for leverage info (skip in demo mode)
-            leverage_df = pd.DataFrame(columns=['symbol', 'maxLeverage'])
-            if not use_demo_data:
-                try:
-                    st.info("📊 Fetching instruments data for leverage information...")
-                    instruments = fetch_instruments()
+            # Fetch instruments for leverage info
+            try:
+                st.info("📊 Fetching instruments data for leverage information...")
+                instruments = fetch_instruments()
+                
+                if not instruments.empty:
+                    # Extract leverage information
+                    leverage_df = extract_leverage_info(instruments)
                     
-                    if not instruments.empty:
-                        # Extract leverage information
-                        leverage_df = extract_leverage_info(instruments)
+                    if debug_mode:
+                        st.write("🔍 Leverage extraction results:")
+                        st.write(f"Total instruments: {len(instruments)}")
+                        st.write(f"Leverage data extracted: {len(leverage_df)}")
+                        st.write(f"Non-null leverage values: {leverage_df['maxLeverage'].notna().sum()}")
                         
-                        if debug_mode:
-                            st.write("🔍 Leverage extraction results:")
-                            st.write(f"Total instruments: {len(instruments)}")
-                            st.write(f"Leverage data extracted: {len(leverage_df)}")
-                            st.write(f"Non-null leverage values: {leverage_df['maxLeverage'].notna().sum()}")
-                    else:
-                        st.warning("⚠️ No instruments data received")
-                        
-                except Exception as e:
-                    st.warning(f"⚠️ Could not fetch instruments data: {str(e)}")
-            else:
-                # Add demo leverage data
-                demo_leverage = []
-                for symbol in tickers['symbol']:
-                    demo_leverage.append({
-                        'symbol': symbol,
-                        'maxLeverage': random.choice([10, 20, 50, 100, 125])
-                    })
-                leverage_df = pd.DataFrame(demo_leverage)
+                        # Show sample leverage data
+                        sample_with_leverage = leverage_df[leverage_df['maxLeverage'].notna()].head()
+                        if not sample_with_leverage.empty:
+                            st.dataframe(sample_with_leverage)
+                        else:
+                            st.warning("No leverage data found!")
+                else:
+                    leverage_df = pd.DataFrame(columns=['symbol', 'maxLeverage'])
+                    st.warning("⚠️ No instruments data received")
+                    
+            except Exception as e:
+                st.warning(f"⚠️ Could not fetch instruments data: {str(e)}")
+                leverage_df = pd.DataFrame(columns=['symbol', 'maxLeverage'])
             
-            # Fetch historical funding rates if requested (skip in demo mode)
+            # Fetch historical funding rates if requested
             funding_history_df = pd.DataFrame()
-            if include_funding_history and not use_demo_data:
+            if include_funding_history:
                 st.info("📊 Fetching historical funding rates...")
                 funding_history_df = fetch_historical_funding_rates(symbols)
-            elif use_demo_data:
-                st.info("📊 Generating demo funding history...")
-                # Create demo funding history
-                demo_funding = []
-                for symbol in symbols:
-                    demo_funding.append({
-                        'symbol': symbol,
-                        'funding_24h_avg': random.uniform(-0.001, 0.001),
-                        'funding_3d_avg': random.uniform(-0.001, 0.001),
-                        'funding_7d_avg': random.uniform(-0.001, 0.001),
-                        'funding_30d_avg': random.uniform(-0.001, 0.001),
-                    })
-                funding_history_df = pd.DataFrame(demo_funding)
             
         except Exception as e:
             st.error(f"❌ Error fetching data: {str(e)}")
@@ -868,3 +723,4 @@ def build_enhanced_dashboard():
 
 if __name__ == "__main__":
     build_enhanced_dashboard()
+    
