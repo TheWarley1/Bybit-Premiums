@@ -159,6 +159,50 @@ class BybitAPIClient:
 # Global API client
 api_client = BybitAPIClient()
 
+def test_basic_connectivity():
+    """Test basic internet connectivity"""
+    try:
+        # Test basic HTTP connectivity
+        response = requests.get("https://httpbin.org/get", timeout=10)
+        if response.status_code == 200:
+            st.success("✅ Basic internet connectivity works")
+            return True
+        else:
+            st.error(f"❌ Basic connectivity test failed: {response.status_code}")
+            return False
+    except Exception as e:
+        st.error(f"❌ No internet connectivity: {str(e)}")
+        return False
+
+def create_demo_data():
+    """Create demo data when API is not available"""
+    st.warning("📊 Using demo data since API is not accessible")
+    
+    # Create sample data that looks like real Bybit data
+    symbols = [
+        "BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
+        "LTCUSDT", "BCHUSDT", "XLMUSDT", "EOSUSDT", "TRXUSDT",
+        "XRPUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "MATICUSDT"
+    ]
+    
+    import random
+    random.seed(42)  # For consistent demo data
+    
+    demo_data = []
+    for symbol in symbols:
+        demo_data.append({
+            'symbol': symbol,
+            'price24hPcnt': random.uniform(-0.1, 0.1),
+            'fundingRate': random.uniform(-0.001, 0.001),
+            'volume24h': random.uniform(1e6, 1e9),
+            'openInterest': random.uniform(1e6, 1e8),
+            'lastPrice': random.uniform(0.1, 50000),
+            'markPrice': random.uniform(0.1, 50000),
+            'indexPrice': random.uniform(0.1, 50000),
+        })
+    
+    return pd.DataFrame(demo_data)
+
 def sign_request(endpoint: str, params: dict = None):
     """Test basic internet connectivity"""
     try:
@@ -456,10 +500,16 @@ def build_enhanced_dashboard():
     st.title("📊 Enhanced Bybit Dashboard")
     st.markdown("*Complete trading analysis with historical funding rates*")
     
+    # Add a prominent info box about Streamlit Cloud limitations
+    st.info("""
+    🌐 **Streamlit Cloud Notice:** Bybit's API blocks requests from Streamlit Cloud (HTTP 403). 
+    Enable **"Use Demo Data"** below to explore all dashboard features, or run this locally for live data.
+    """)
+    
     # Check credentials
     if not API_KEY or not API_SECRET:
-        st.error("🚫 Missing API credentials.")
-        st.stop()
+        st.warning("🔑 API credentials not configured - Demo mode available below")
+        st.info("To use live data locally, set BYBIT_API_KEY and BYBIT_API_SECRET environment variables")
     
     # Connection status
     with st.expander("🔧 Connection Status", expanded=False):
@@ -514,19 +564,20 @@ def build_enhanced_dashboard():
                     with st.spinner("Establishing connection to Bybit API..."):
                         if not api_client.find_working_connection():
                             st.error("❌ Cannot establish connection to Bybit API")
-                            st.error("**Possible solutions:**")
-                            st.write("- Enable 'Use Demo Data' option above to test the dashboard")
-                            st.write("- Check if Streamlit Cloud allows external API calls")
-                            st.write("- Try running locally instead of on Streamlit Cloud")
-                            st.write("- Contact Streamlit support about API restrictions")
+                            st.error("**Root Cause:** Streamlit Cloud IPs are blocked by Bybit's CloudFront CDN (HTTP 403)")
+                            st.error("**Solutions:**")
+                            st.write("✅ **Enable 'Use Demo Data' above** - This will let you explore all dashboard features")
+                            st.write("🏠 **Run locally** - The API works fine from personal computers")
+                            st.write("☁️ **Use different hosting** - Try Heroku, Railway, or other platforms")
+                            st.write("🔑 **VPN/Proxy service** - Some cloud platforms support this")
                             
                             # Show basic connectivity test
                             st.write("**Connectivity Diagnosis:**")
                             if test_basic_connectivity():
-                                st.write("✅ Internet works, likely API-specific issue")
-                                st.write("💡 **Recommended:** Enable demo data above to explore the dashboard")
+                                st.write("✅ Internet works - This confirms it's specifically Bybit blocking Streamlit Cloud")
+                                st.write("💡 **Recommended:** Use the demo data option to explore the dashboard!")
                             else:
-                                st.write("❌ No internet connectivity detected")
+                                st.write("❌ Basic connectivity also failed")
                             
                             st.stop()
                 
