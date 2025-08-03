@@ -25,74 +25,45 @@ API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 RECV_WINDOW = 5000
 
-# Multiple fallback methods for accessing Bybit API
-class BybitAPIWorkaround:
+# Simplified API client for cloud hosting compatibility
+class BybitAPIClient:
     def __init__(self):
-        # Known Bybit IP addresses (may change over time)
-        self.bybit_ips = [
-            "104.18.10.26",
-            "104.18.11.26", 
-            "172.67.74.226",
-            "104.18.8.26",
-            "104.18.9.26"
-        ]
-        
-        # Alternative API endpoints
-        self.alternative_endpoints = [
+        # Primary endpoints to try
+        self.endpoints = [
             "https://api.bybit.com",
-            "https://api.bytick.com",  # Alternative domain
+            "https://api.bytick.com",
+            "https://api-testnet.bybit.com"  # Fallback testnet
         ]
         
         self.working_endpoint = None
         self.session = None
         
-    def create_dns_bypass_session(self, target_ip):
-        """Create a session that bypasses DNS by using direct IP"""
+    def create_session(self):
+        """Create a robust session with retries"""
         session = requests.Session()
         
-        # Custom adapter for DNS bypass
-        class DNSBypassAdapter(HTTPAdapter):
-            def __init__(self, target_ip, target_host="api.bybit.com"):
-                self.target_ip = target_ip
-                self.target_host = target_host
-                super().__init__()
-            
-            def send(self, request, **kwargs):
-                # Replace hostname with IP in URL
-                if self.target_host in request.url:
-                    request.url = request.url.replace(self.target_host, self.target_ip)
-                    # Critical: Set Host header for proper routing
-                    request.headers['Host'] = self.target_host
-                
-                # Disable SSL verification for IP connections
-                kwargs['verify'] = False
-                
-                return super().send(request, **kwargs)
-        
-        # Mount the custom adapter
-        adapter = DNSBypassAdapter(target_ip)
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
-        
-        # Set reasonable timeouts and retries
+        # Set up retry strategy
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
-        session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        # Set reasonable timeout
+        session.timeout = 30
         
         return session
     
-    def test_endpoint(self, endpoint_or_ip, is_ip=False):
+    def test_endpoint(self, endpoint):
         """Test if an endpoint is accessible"""
         try:
-            if is_ip:
-                session = self.create_dns_bypass_session(endpoint_or_ip)
-                test_url = f"https://{endpoint_or_ip}/v5/market/time"
-            else:
-                session = requests.Session()
-                test_url = f"{endpoint_or_ip}/v5/market/time"
+            session = self.create_session()
+            test_url = f"{endpoint}/v5/market/time"
             
             response = session.get(test_url, timeout=10)
             if response.status_code == 200:
@@ -100,34 +71,31 @@ class BybitAPIWorkaround:
                 if data.get("retCode") == 0:
                     return True, session
         except Exception as e:
-            st.write(f"Failed to connect to {endpoint_or_ip}: {str(e)[:100]}...")
+            # Only show error in debug mode to avoid cluttering UI
+            pass
         
         return False, None
     
     def find_working_connection(self):
         """Find a working connection method"""
-        st.info("🔍 Testing connection methods...")
+        st.info("🔍 Testing Bybit API connection...")
         
-        # Method 1: Try standard endpoints first
-        for endpoint in self.alternative_endpoints:
-            st.write(f"Testing endpoint: {endpoint}")
+        for endpoint in self.endpoints:
             success, session = self.test_endpoint(endpoint)
             if success:
-                st.success(f"✅ Connected via: {endpoint}")
+                st.success(f"✅ Connected to Bybit API")
                 self.working_endpoint = endpoint
                 self.session = session
                 return True
         
-        # Method 2: Try direct IP connections
-        st.write("Standard endpoints failed. Trying direct IP connections...")
-        for ip in self.bybit_ips:
-            st.write(f"Testing IP: {ip}")
-            success, session = self.test_endpoint(ip, is_ip=True)
-            if success:
-                st.success(f"✅ Connected via IP: {ip}")
-                self.working_endpoint = f"https://{ip}"
-                self.session = session
-                return True
+        # If all fail, try once more with the primary endpoint
+        st.warning("⚠️ Initial connection attempts failed. Retrying primary endpoint...")
+        success, session = self.test_endpoint(self.endpoints[0])
+        if success:
+            st.success(f"✅ Connected to Bybit API")
+            self.working_endpoint = self.endpoints[0]
+            self.session = session
+            return True
         
         return False
     
@@ -135,24 +103,36 @@ class BybitAPIWorkaround:
         """Make an API request using the working connection"""
         if not self.session or not self.working_endpoint:
             if not self.find_working_connection():
-                raise Exception("No working connection found")
+                raise Exception("Unable to connect to Bybit API. Please check your internet connection.")
         
         if headers is None:
             headers = {}
         
         # Construct full URL
-        if self.working_endpoint.startswith("https://"):
-            url = f"{self.working_endpoint}{endpoint}"
-        else:
-            url = f"https://{self.working_endpoint}{endpoint}"
+        url = f"{self.working_endpoint}{endpoint}"
         
-        # Make request
-        response = self.session.get(url, params=params, headers=headers, timeout=20)
-        response.raise_for_status()
-        return response.json()
+        # Make request with error handling
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, headers=headers, timeout=30)
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.Timeout:
+                if attempt == max_retries - 1:
+                    raise Exception(f"Request timeout after {max_retries} attempts")
+                time.sleep(1)
+            except requests.exceptions.ConnectionError:
+                if attempt == max_retries - 1:
+                    raise Exception("Connection error. Please check your internet connection.")
+                time.sleep(1)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise Exception(f"API request failed: {str(e)}")
+                time.sleep(1)
 
 # Global API client
-api_client = BybitAPIWorkaround()
+api_client = BybitAPIClient()
 
 def sign_request(endpoint: str, params: dict = None):
     """Sign and execute API request with DNS workaround"""
@@ -415,13 +395,14 @@ def build_enhanced_dashboard():
         st.stop()
     
     # Connection status
-    with st.expander("🔧 Connection Status", expanded=True):
+    with st.expander("🔧 Connection Status", expanded=False):
         if st.button("🔄 Test Connection"):
             if api_client.find_working_connection():
                 st.success("✅ Successfully connected to Bybit API!")
                 st.info(f"Using endpoint: {api_client.working_endpoint}")
             else:
-                st.error("❌ Could not establish connection")
+                st.error("❌ Could not establish connection to Bybit API")
+                st.error("Please check your internet connection and try again.")
                 st.stop()
     
     # Sidebar controls
@@ -448,9 +429,15 @@ def build_enhanced_dashboard():
         try:
             # Ensure connection
             if not api_client.working_endpoint:
-                if not api_client.find_working_connection():
-                    st.error("❌ Cannot establish connection")
-                    st.stop()
+                with st.spinner("Establishing connection to Bybit API..."):
+                    if not api_client.find_working_connection():
+                        st.error("❌ Cannot establish connection to Bybit API")
+                        st.error("This may be due to:")
+                        st.write("- Network connectivity issues")
+                        st.write("- Bybit API being temporarily unavailable")
+                        st.write("- Firewall restrictions")
+                        st.write("Try refreshing the page or check back later.")
+                        st.stop()
             
             # Fetch tickers (includes current funding rates)
             tickers = fetch_tickers()
@@ -723,4 +710,3 @@ def build_enhanced_dashboard():
 
 if __name__ == "__main__":
     build_enhanced_dashboard()
-    
